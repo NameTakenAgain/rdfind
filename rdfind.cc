@@ -10,9 +10,13 @@ static_assert(__cplusplus >= 201703L,
               "this code requires a C++17 capable compiler!");
 
 // std
+#include <algorithm>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 // project
@@ -26,8 +30,16 @@ static_assert(__cplusplus >= 201703L,
 
 // this vector holds the information about all files found
 std::vector<Fileinfo> filelist;
+std::vector<Fileinfo> allfilelist;
 struct Options;
 const Options* global_options{};
+
+struct ScannedArgument
+{
+  std::string path;
+  int cmdline_index;
+  bool is_directory;
+};
 
 /**
  * this contains the command line index for the path currently
@@ -292,12 +304,105 @@ report(const std::string& path, const std::string& name, int depth)
       const auto size = tmp.size();
       if (size >= global_options->minimumfilesize &&
           size < global_options->maximumfilesize) {
+        allfilelist.emplace_back(tmp);
         filelist.emplace_back(std::move(tmp));
       }
     }
   } else {
     std::cerr << "failed to read file info on file \"" << tmp.name() << "\"\n";
     return -1;
+  }
+  return 0;
+}
+
+
+static std::vector<std::pair<std::string, std::string>>
+find_duplicate_directories(
+  std::vector<Fileinfo> directory_files,
+  const std::vector<ScannedArgument>& scanned_args,
+  Fileinfo::readtobuffermode fingerprint_mode,
+  long nsecsleep,
+  std::size_t buffersize)
+{
+  if (directory_files.empty()) {
+    return {};
+  }
+
+  Rdutil all_files_helper(directory_files);
+  all_files_helper.fillwithbytes(fingerprint_mode,
+                                 Fileinfo::readtobuffermode::NOT_DEFINED,
+                                 nsecsleep,
+                                 buffersize);
+
+  using Fingerprint = std::pair<Fileinfo::filesizetype, std::string>;
+  using DirectorySignature = std::map<std::string, Fingerprint>;
+
+  std::map<int, DirectorySignature> signatures_by_cmdline_index;
+
+  for (const auto& file : directory_files) {
+    const auto scanned_it =
+      std::find_if(scanned_args.begin(),
+                   scanned_args.end(),
+                   [&](const ScannedArgument& arg) {
+                     return arg.cmdline_index == file.get_cmdline_index();
+                   });
+    if (scanned_it == scanned_args.end() || !scanned_it->is_directory) {
+      continue;
+    }
+
+    const std::string prefix = scanned_it->path + "/";
+    if (file.name().rfind(prefix, 0) != 0) {
+      continue;
+    }
+    const std::string relative_name = file.name().substr(prefix.size());
+
+    signatures_by_cmdline_index[file.get_cmdline_index()][relative_name] =
+      std::make_pair(file.size(),
+                     std::string(file.getbyteptr(), file.getbuffersize()));
+  }
+
+  std::vector<std::pair<std::string, std::string>> duplicates;
+  for (auto left = scanned_args.begin(); left != scanned_args.end(); ++left) {
+    if (!left->is_directory) {
+      continue;
+    }
+    const auto left_sig = signatures_by_cmdline_index.find(left->cmdline_index);
+    if (left_sig == signatures_by_cmdline_index.end() ||
+        left_sig->second.empty()) {
+      continue;
+    }
+    for (auto right = std::next(left); right != scanned_args.end(); ++right) {
+      if (!right->is_directory) {
+        continue;
+      }
+      const auto right_sig =
+        signatures_by_cmdline_index.find(right->cmdline_index);
+      if (right_sig == signatures_by_cmdline_index.end() ||
+          right_sig->second.empty()) {
+        continue;
+      }
+      if (left_sig->second == right_sig->second) {
+        duplicates.emplace_back(right->path, left->path);
+      }
+    }
+  }
+  return duplicates;
+}
+
+static int
+append_duplicate_directories(
+  const std::string& resultsfile,
+  const std::vector<std::pair<std::string, std::string>>& duplicate_dirs)
+{
+  std::ofstream out(resultsfile.c_str(), std::ios_base::app);
+  if (!out.is_open()) {
+    std::cerr << "could not append duplicate directory information to \""
+              << resultsfile << "\"\n";
+    return -1;
+  }
+  out << "# duplicate directories (duplicate original)\n";
+  for (const auto& duplicate : duplicate_dirs) {
+    out << "DUPDIR " << duplicate.first << " " << duplicate.second << "\n";
   }
   return 0;
 }
@@ -331,6 +436,7 @@ main(int narg, const char* argv[])
   dirlist.setcallbackfcn(&report);
 
   // now loop over path list and add the files
+  std::vector<ScannedArgument> scanned_args;
 
   // done with arguments. start parsing files and directories!
   for (; parser.has_args_left(); parser.advance()) {
@@ -348,9 +454,12 @@ main(int narg, const char* argv[])
     std::cout << dryruntext << "Now scanning \"" << file_or_dir << "\"";
     std::cout.flush();
     current_cmdline_index = parser.get_current_index();
-    dirlist.walk(file_or_dir, 0);
+    const int walk_result = dirlist.walk(file_or_dir, 0);
     std::cout << ", found " << filelist.size() - lastsize << " files."
               << std::endl;
+
+    scanned_args.push_back(
+      { file_or_dir, parser.get_current_index(), walk_result == 2 });
 
     // if we want deterministic output, we will sort the newly added
     // items on depth, then filename.
@@ -434,11 +543,18 @@ main(int narg, const char* argv[])
   std::cout << dryruntext << "Totally, ";
   gswd.saveablespace(std::cout) << " can be reduced." << std::endl;
 
+  const auto duplicate_directories = find_duplicate_directories(
+    allfilelist, scanned_args, modes.back().first, o.nsecsleep, o.buffersize);
+  std::cout << dryruntext << "Found " << duplicate_directories.size()
+            << " duplicate directories among the scanned directory arguments."
+            << std::endl;
+
   // traverse the list and make a nice file with the results
   if (o.makeresultsfile) {
     std::cout << dryruntext << "Now making results file " << o.resultsfile
               << std::endl;
     gswd.printtofile(o.resultsfile);
+    append_duplicate_directories(o.resultsfile, duplicate_directories);
   }
 
   // traverse the list and replace with symlinks
