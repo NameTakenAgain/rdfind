@@ -315,14 +315,12 @@ report(const std::string& path, const std::string& name, int depth)
   return 0;
 }
 
-
 static std::vector<std::pair<std::string, std::string>>
-find_duplicate_directories(
-  std::vector<Fileinfo> directory_files,
-  const std::vector<ScannedArgument>& scanned_args,
-  Fileinfo::readtobuffermode fingerprint_mode,
-  long nsecsleep,
-  std::size_t buffersize)
+find_duplicate_directories(std::vector<Fileinfo> directory_files,
+                           const std::vector<ScannedArgument>& scanned_args,
+                           Fileinfo::readtobuffermode fingerprint_mode,
+                           long nsecsleep,
+                           std::size_t buffersize)
 {
   if (directory_files.empty()) {
     return {};
@@ -337,52 +335,77 @@ find_duplicate_directories(
   using Fingerprint = std::pair<Fileinfo::filesizetype, std::string>;
   using DirectorySignature = std::map<std::string, Fingerprint>;
 
-  std::map<int, DirectorySignature> signatures_by_cmdline_index;
+  using DirectoryKey = std::pair<int, std::string>;
+  std::map<DirectoryKey, DirectorySignature> signatures_by_directory;
+  std::map<DirectoryKey, int> depth_by_directory;
+
+  std::map<int, std::string> root_by_cmdline_index;
+  for (const auto& scanned : scanned_args) {
+    if (scanned.is_directory) {
+      root_by_cmdline_index[scanned.cmdline_index] = scanned.path;
+    }
+  }
 
   for (const auto& file : directory_files) {
-    const auto scanned_it =
-      std::find_if(scanned_args.begin(),
-                   scanned_args.end(),
-                   [&](const ScannedArgument& arg) {
-                     return arg.cmdline_index == file.get_cmdline_index();
-                   });
-    if (scanned_it == scanned_args.end() || !scanned_it->is_directory) {
+    const auto root_it = root_by_cmdline_index.find(file.get_cmdline_index());
+    if (root_it == root_by_cmdline_index.end()) {
       continue;
     }
 
-    const std::string prefix = scanned_it->path + "/";
+    const std::string& root = root_it->second;
+
+    const std::string prefix = root + "/";
     if (file.name().rfind(prefix, 0) != 0) {
       continue;
     }
     const std::string relative_name = file.name().substr(prefix.size());
+    const Fingerprint fingerprint = std::make_pair(
+      file.size(), std::string(file.getbyteptr(), file.getbuffersize()));
 
-    signatures_by_cmdline_index[file.get_cmdline_index()][relative_name] =
-      std::make_pair(file.size(),
-                     std::string(file.getbyteptr(), file.getbuffersize()));
+    int depth = 0;
+    signatures_by_directory[{ file.get_cmdline_index(), root }][relative_name] =
+      fingerprint;
+    depth_by_directory.try_emplace({ file.get_cmdline_index(), root }, depth);
+
+    auto slash_pos = relative_name.find('/');
+    while (slash_pos != std::string::npos) {
+      ++depth;
+      const std::string directory =
+        root + "/" + relative_name.substr(0, slash_pos);
+      const std::string directory_relative_name =
+        relative_name.substr(slash_pos + 1);
+      signatures_by_directory[{ file.get_cmdline_index(), directory }]
+                             [directory_relative_name] = fingerprint;
+      depth_by_directory.try_emplace({ file.get_cmdline_index(), directory },
+                                     depth);
+      slash_pos = relative_name.find('/', slash_pos + 1);
+    }
   }
 
+  std::vector<DirectoryKey> directories;
+  directories.reserve(signatures_by_directory.size());
+  for (const auto& entry : signatures_by_directory) {
+    if (!entry.second.empty()) {
+      directories.push_back(entry.first);
+    }
+  }
+
+  std::sort(directories.begin(),
+            directories.end(),
+            [&](const auto& left, const auto& right) {
+              const auto left_depth = depth_by_directory.at(left);
+              const auto right_depth = depth_by_directory.at(right);
+              return std::tie(left.first, left_depth, left.second) <
+                     std::tie(right.first, right_depth, right.second);
+            });
+
   std::vector<std::pair<std::string, std::string>> duplicates;
-  for (auto left = scanned_args.begin(); left != scanned_args.end(); ++left) {
-    if (!left->is_directory) {
-      continue;
-    }
-    const auto left_sig = signatures_by_cmdline_index.find(left->cmdline_index);
-    if (left_sig == signatures_by_cmdline_index.end() ||
-        left_sig->second.empty()) {
-      continue;
-    }
-    for (auto right = std::next(left); right != scanned_args.end(); ++right) {
-      if (!right->is_directory) {
-        continue;
-      }
-      const auto right_sig =
-        signatures_by_cmdline_index.find(right->cmdline_index);
-      if (right_sig == signatures_by_cmdline_index.end() ||
-          right_sig->second.empty()) {
-        continue;
-      }
-      if (left_sig->second == right_sig->second) {
-        duplicates.emplace_back(right->path, left->path);
+  for (auto left = directories.begin(); left != directories.end(); ++left) {
+    const auto& left_sig = signatures_by_directory.at(*left);
+    for (auto right = std::next(left); right != directories.end(); ++right) {
+      const auto& right_sig = signatures_by_directory.at(*right);
+      if (left_sig == right_sig) {
+        duplicates.emplace_back(right->second, left->second);
       }
     }
   }
