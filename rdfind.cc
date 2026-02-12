@@ -17,6 +17,7 @@ static_assert(__cplusplus >= 201703L,
 #include <map>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 // project
@@ -316,24 +317,95 @@ report(const std::string& path, const std::string& name, int depth)
 }
 
 static std::vector<std::pair<std::string, std::string>>
-find_duplicate_directories(std::vector<Fileinfo> directory_files,
-                           const std::vector<ScannedArgument>& scanned_args,
-                           Fileinfo::readtobuffermode fingerprint_mode,
-                           long nsecsleep,
-                           std::size_t buffersize)
+find_duplicate_directories(const std::vector<Fileinfo>& directory_files,
+                           const std::vector<Fileinfo>& duplicate_files,
+                           const std::vector<ScannedArgument>& scanned_args)
 {
   if (directory_files.empty()) {
     return {};
   }
 
-  Rdutil all_files_helper(directory_files);
-  all_files_helper.fillwithbytes(fingerprint_mode,
-                                 Fileinfo::readtobuffermode::NOT_DEFINED,
-                                 nsecsleep,
-                                 buffersize);
+  using InodeKey = std::pair<unsigned long, unsigned long>;
+  struct InodeKeyHasher
+  {
+    std::size_t operator()(const InodeKey& key) const
+    {
+      const std::size_t left = std::hash<unsigned long>{}(key.first);
+      const std::size_t right = std::hash<unsigned long>{}(key.second);
+      return left ^ (right + 0x9e3779b9 + (left << 6) + (left >> 2));
+    }
+  };
 
-  using Fingerprint = std::pair<Fileinfo::filesizetype, std::string>;
-  using DirectorySignature = std::map<std::string, Fingerprint>;
+  class UnionFind
+  {
+  public:
+    std::size_t add(const InodeKey& key)
+    {
+      const auto [it, inserted] = m_index_by_key.try_emplace(key, m_parent.size());
+      if (inserted) {
+        m_parent.push_back(it->second);
+      }
+      return it->second;
+    }
+
+    void unite(const InodeKey& left, const InodeKey& right)
+    {
+      const std::size_t left_id = add(left);
+      const std::size_t right_id = add(right);
+      const std::size_t left_root = find(left_id);
+      const std::size_t right_root = find(right_id);
+      if (left_root != right_root) {
+        m_parent[right_root] = left_root;
+      }
+    }
+
+    const std::size_t* find_if_exists(const InodeKey& key)
+    {
+      const auto it = m_index_by_key.find(key);
+      if (it == m_index_by_key.end()) {
+        return nullptr;
+      }
+      m_tmp_root = find(it->second);
+      return &m_tmp_root;
+    }
+
+  private:
+    std::size_t find(std::size_t id)
+    {
+      auto parent = m_parent[id];
+      while (parent != m_parent[parent]) {
+        parent = m_parent[parent];
+      }
+      while (m_parent[id] != id) {
+        const auto next = m_parent[id];
+        m_parent[id] = parent;
+        id = next;
+      }
+      return parent;
+    }
+
+    std::unordered_map<InodeKey, std::size_t, InodeKeyHasher> m_index_by_key;
+    std::vector<std::size_t> m_parent;
+    std::size_t m_tmp_root{};
+  };
+
+  // Build duplicate classes from the first duplicate-finding pass.
+  UnionFind duplicate_classes;
+  std::unordered_map<std::int64_t, InodeKey> representative_by_identity;
+  for (const auto& file : duplicate_files) {
+    const InodeKey key{ file.device(), file.inode() };
+    const auto identity = file.getidentity();
+    const auto group_id = identity < 0 ? -identity : identity;
+
+    const auto [it, inserted] = representative_by_identity.try_emplace(group_id, key);
+    if (!inserted) {
+      duplicate_classes.unite(it->second, key);
+    } else {
+      duplicate_classes.add(key);
+    }
+  }
+
+  using DirectorySignature = std::map<std::string, std::string>;
 
   using DirectoryKey = std::pair<int, std::string>;
   std::map<DirectoryKey, DirectorySignature> signatures_by_directory;
@@ -359,12 +431,17 @@ find_duplicate_directories(std::vector<Fileinfo> directory_files,
       continue;
     }
     const std::string relative_name = file.name().substr(prefix.size());
-    const Fingerprint fingerprint = std::make_pair(
-      file.size(), std::string(file.getbyteptr(), file.getbuffersize()));
+    const InodeKey inode_key{ file.device(), file.inode() };
+    const auto* duplicate_class = duplicate_classes.find_if_exists(inode_key);
+    const std::string content_id = duplicate_class != nullptr
+                                     ? std::string("dup:") + std::to_string(*duplicate_class)
+                                     : std::string("inode:") +
+                                         std::to_string(inode_key.first) + ":" +
+                                         std::to_string(inode_key.second);
 
     int depth = 0;
     signatures_by_directory[{ file.get_cmdline_index(), root }][relative_name] =
-      fingerprint;
+      content_id;
     depth_by_directory.try_emplace({ file.get_cmdline_index(), root }, depth);
 
     auto slash_pos = relative_name.find('/');
@@ -375,7 +452,7 @@ find_duplicate_directories(std::vector<Fileinfo> directory_files,
       const std::string directory_relative_name =
         relative_name.substr(slash_pos + 1);
       signatures_by_directory[{ file.get_cmdline_index(), directory }]
-                             [directory_relative_name] = fingerprint;
+                             [directory_relative_name] = content_id;
       depth_by_directory.try_emplace({ file.get_cmdline_index(), directory },
                                      depth);
       slash_pos = relative_name.find('/', slash_pos + 1);
@@ -566,8 +643,8 @@ main(int narg, const char* argv[])
   std::cout << dryruntext << "Totally, ";
   gswd.saveablespace(std::cout) << " can be reduced." << std::endl;
 
-  const auto duplicate_directories = find_duplicate_directories(
-    allfilelist, scanned_args, modes.back().first, o.nsecsleep, o.buffersize);
+  const auto duplicate_directories =
+    find_duplicate_directories(allfilelist, filelist, scanned_args);
   std::cout << dryruntext << "Found " << duplicate_directories.size()
             << " duplicate directories among the scanned directory arguments."
             << std::endl;
