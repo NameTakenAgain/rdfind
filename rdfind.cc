@@ -18,6 +18,7 @@ static_assert(__cplusplus >= 201703L,
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // project
@@ -486,7 +487,57 @@ find_duplicate_directories(const std::vector<Fileinfo>& directory_files,
       }
     }
   }
-  return duplicates;
+
+  struct DuplicatePairHasher
+  {
+    std::size_t operator()(const std::pair<std::string, std::string>& pair) const
+    {
+      const std::size_t left = std::hash<std::string>{}(pair.first);
+      const std::size_t right = std::hash<std::string>{}(pair.second);
+      return left ^ (right + 0x9e3779b9 + (left << 6) + (left >> 2));
+    }
+  };
+
+  const auto parent_path = [](const std::string& path) {
+    const auto slash = path.rfind('/');
+    if (slash == std::string::npos) {
+      return std::string{};
+    }
+    if (slash == 0) {
+      return path.size() == 1 ? std::string{} : std::string("/");
+    }
+    return path.substr(0, slash);
+  };
+
+  std::unordered_set<std::pair<std::string, std::string>, DuplicatePairHasher>
+    duplicate_set(duplicates.begin(), duplicates.end());
+
+  std::vector<std::pair<std::string, std::string>> filtered_duplicates;
+  filtered_duplicates.reserve(duplicates.size());
+
+  for (const auto& duplicate : duplicates) {
+    std::string duplicate_parent = duplicate.first;
+    std::string original_parent = duplicate.second;
+    bool covered_by_ancestor = false;
+
+    while (!duplicate_parent.empty() && !original_parent.empty()) {
+      duplicate_parent = parent_path(duplicate_parent);
+      original_parent = parent_path(original_parent);
+      if (duplicate_parent.empty() || original_parent.empty()) {
+        break;
+      }
+      if (duplicate_set.count({ duplicate_parent, original_parent }) > 0U) {
+        covered_by_ancestor = true;
+        break;
+      }
+    }
+
+    if (!covered_by_ancestor) {
+      filtered_duplicates.push_back(duplicate);
+    }
+  }
+
+  return filtered_duplicates;
 }
 
 static int
